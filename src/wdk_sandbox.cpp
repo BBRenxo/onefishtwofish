@@ -232,17 +232,16 @@ uint64_t apply_pe64_relocations(
         return 0;
     }
     const DataDirPair reloc_dir = read_pe64_data_dir(pe, 5);
-    if (reloc_dir.rva == 0 || reloc_dir.size < 8) {
-        return 0;
-    }
-    if (static_cast<size_t>(reloc_dir.rva) + reloc_dir.size > mapped_img.size()) {
+    if (reloc_dir.rva == 0 || reloc_dir.size < 8 || reloc_dir.rva >= mapped_img.size()) {
         return 0;
     }
 
     const int64_t delta = static_cast<int64_t>(target_base - orig_base);
     uint64_t applied = 0;
     size_t pos = reloc_dir.rva;
-    const size_t end = reloc_dir.rva + reloc_dir.size;
+    const size_t avail_span = mapped_img.size() - static_cast<size_t>(reloc_dir.rva);
+    const size_t clamped_sz = std::min<size_t>(reloc_dir.size, avail_span);
+    const size_t end = static_cast<size_t>(reloc_dir.rva) + clamped_sz;
 
     while (pos + 8 <= end) {
         const uint32_t page_rva = read_u32_le(mapped_img.data() + pos);
@@ -276,22 +275,36 @@ void init_security_cookie_in_image(
     std::vector<uint8_t>& mapped_img,
     uint64_t target_base) {
     const DataDirPair lc_dir = read_pe64_data_dir(pe, 10);
-    if (lc_dir.rva == 0 || static_cast<size_t>(lc_dir.rva) + 0x60 > mapped_img.size()) {
+    if (lc_dir.rva == 0 || lc_dir.size < 0x60 ||
+        static_cast<size_t>(lc_dir.rva) + 0x60 > mapped_img.size()) {
+        return;
+    }
+    const uint32_t lc_struct_sz = read_u32_le(mapped_img.data() + lc_dir.rva);
+    if (lc_struct_sz < 0x60) {
         return;
     }
     const uint64_t cookie_va = read_u64_le(mapped_img.data() + lc_dir.rva + 0x58);
     uint64_t cookie_rva = 0;
-    if (cookie_va >= target_base && (cookie_va - target_base) + 16 <= mapped_img.size()) {
+    if (cookie_va >= target_base && (cookie_va - target_base) + 8 <= mapped_img.size()) {
         cookie_rva = cookie_va - target_base;
-    } else if (cookie_va >= pe.image_base() && (cookie_va - pe.image_base()) + 16 <= mapped_img.size()) {
+    } else if (cookie_va >= pe.image_base() && (cookie_va - pe.image_base()) + 8 <= mapped_img.size()) {
         cookie_rva = cookie_va - pe.image_base();
     } else {
         return;
     }
 
-    constexpr uint64_t kCustomCookie = 0x00007A4E91C3B82DULL;
-    write_u64_le(mapped_img.data() + cookie_rva, kCustomCookie);
-    write_u64_le(mapped_img.data() + cookie_rva + 8, ~kCustomCookie);
+    constexpr uint64_t kDefaultMsvcCookie64 = 0x00002B992DDFA232ULL;
+    constexpr uint64_t kCustomCookie        = 0x00007A4E91C3B82DULL;
+    const uint64_t cur_cookie = read_u64_le(mapped_img.data() + cookie_rva);
+    if (cur_cookie == 0ULL || cur_cookie == kDefaultMsvcCookie64) {
+        write_u64_le(mapped_img.data() + cookie_rva, kCustomCookie);
+        if (cookie_rva + 16 <= mapped_img.size()) {
+            const uint64_t cur_comp = read_u64_le(mapped_img.data() + cookie_rva + 8);
+            if (cur_comp == 0ULL || cur_comp == ~kDefaultMsvcCookie64) {
+                write_u64_le(mapped_img.data() + cookie_rva + 8, ~kCustomCookie);
+            }
+        }
+    }
 }
 
 struct StubEntryDesc {
@@ -315,35 +328,51 @@ struct SandboxRuntimeCtx {
     uint64_t pool_cursor = 0;
     uint64_t pool_limit = 0;
     uint64_t dummy_ntos_base = 0;
+    uint64_t kthread_va = 0;
+    uint64_t eprocess_va = 0;
+    uint64_t kuser_base = 0;
+    uint64_t kuser_alias = 0;
     uint64_t max_instructions = 25000;
     uint32_t os_build_number = 26100;
     uint32_t zero_slide_run = 0;
     std::unordered_map<uint64_t, StubEntryDesc> addr_to_stub;
+    std::unordered_map<std::string, uint64_t> name_to_stub;
     std::set<uint64_t> mapped_pages;
 };
+
+uint64_t alloc_pool_slice(SandboxRuntimeCtx* ctx, uint64_t req_sz) noexcept {
+    if (req_sz == 0 || req_sz > 0x100000ULL) {
+        req_sz = 0x1000ULL;
+    }
+    const uint64_t aligned = (req_sz + 0xFULL) & ~0xFULL;
+    if (ctx->pool_cursor + aligned <= ctx->pool_limit) {
+        const uint64_t out_ptr = ctx->pool_cursor;
+        ctx->pool_cursor += aligned;
+        return out_ptr;
+    }
+    return 0;
+}
 
 uint64_t emulate_kernel_stub(
     uc_engine* uc,
     SandboxRuntimeCtx* ctx,
     const StubEntryDesc& stub,
+    uint64_t rsp,
     uint64_t rcx,
     uint64_t rdx,
     uint64_t r8,
     uint64_t r9) {
     const auto& fn = stub.func_name;
 
-    if (fn == "ExAllocatePoolWithTag" || fn == "ExAllocatePool2" || fn == "ExAllocatePool") {
-        uint64_t req_sz = (fn == "ExAllocatePool2") ? rdx : rdx;
-        if (req_sz == 0 || req_sz > 0x100000ULL) {
-            req_sz = 0x1000ULL;
-        }
-        const uint64_t aligned = (req_sz + 0xFULL) & ~0xFULL;
-        if (ctx->pool_cursor + aligned <= ctx->pool_limit) {
-            const uint64_t out_ptr = ctx->pool_cursor;
-            ctx->pool_cursor += aligned;
-            return out_ptr;
-        }
-        return 0;
+    if (fn == "ExAllocatePoolWithTag" || fn == "ExAllocatePool2" ||
+        fn == "ExAllocatePool" || fn == "ExAllocatePoolZero" ||
+        fn == "ExAllocatePoolWithQuotaTag") {
+        return alloc_pool_slice(ctx, rdx);
+    }
+
+    if (fn == "MmAllocateContiguousMemory" || fn == "MmAllocateContiguousNodeMemory" ||
+        fn == "MmAllocateContiguousMemorySpecifyCache") {
+        return alloc_pool_slice(ctx, rcx);
     }
 
     if (fn == "RtlInitUnicodeString" || fn == "RtlInitUnicodeStringEx") {
@@ -398,8 +427,28 @@ uint64_t emulate_kernel_stub(
         return ticks;
     }
 
+    if (fn == "KeQueryPerformanceCounter") {
+        if (rcx != 0) {
+            const uint64_t freq = 10000000ULL;
+            ctx->api->mem_write(uc, rcx, &freq, sizeof(freq));
+        }
+        return 0x0000001000000000ULL + ctx->res->instructions_executed * 10ULL;
+    }
+
+    if (fn == "KeQueryTimeIncrement") {
+        return 156250U;
+    }
+
     if (fn == "KeGetCurrentIrql") {
         return 0; // PASSIVE_LEVEL
+    }
+
+    if (fn == "IoGetCurrentProcess" || fn == "PsGetCurrentProcess" || fn == "PsInitialSystemProcess") {
+        return ctx->eprocess_va;
+    }
+
+    if (fn == "PsGetCurrentThread" || fn == "KeGetCurrentThread") {
+        return ctx->kthread_va;
     }
 
     if (fn == "PsGetCurrentProcessId") {
@@ -410,9 +459,50 @@ uint64_t emulate_kernel_stub(
         return 0x104;
     }
 
+    if (fn == "PsLookupProcessByProcessId") {
+        if (rdx != 0) {
+            ctx->api->mem_write(uc, rdx, &ctx->eprocess_va, sizeof(ctx->eprocess_va));
+        }
+        return 0;
+    }
+
+    if (fn == "MmIsAddressValid") {
+        if (rcx == 0) {
+            return 0;
+        }
+        uint8_t probe = 0;
+        return (ctx->api->mem_read(uc, rcx, &probe, 1) == kUcErrOk) ? 1ULL : 0ULL;
+    }
+
     if (fn == "MmGetSystemRoutineAddress") {
-        // Return a safe stub pointer at the end of the stub table (generic NTSTATUS=0 stub)
-        return ctx->stub_base;
+        if (rcx == 0) {
+            return 0;
+        }
+        uint8_t ustr[16]{};
+        if (ctx->api->mem_read(uc, rcx, ustr, sizeof(ustr)) != kUcErrOk) {
+            return 0;
+        }
+        const uint16_t byte_len = read_u16_le(ustr + 0);
+        const uint64_t buf_va   = read_u64_le(ustr + 8);
+        if (byte_len < 2 || buf_va == 0) {
+            return 0;
+        }
+        const size_t wchar_cnt = std::min<size_t>(byte_len / 2U, 255U);
+        std::vector<uint16_t> wbuf(wchar_cnt, 0);
+        if (ctx->api->mem_read(uc, buf_va, wbuf.data(), wchar_cnt * 2U) != kUcErrOk) {
+            return 0;
+        }
+        std::string target_name;
+        target_name.reserve(wchar_cnt);
+        for (uint16_t wc : wbuf) {
+            if (wc == 0) break;
+            if (wc >= 0x80U) return 0;
+            target_name.push_back(static_cast<char>(wc));
+        }
+        if (const auto it = ctx->name_to_stub.find(target_name); it != ctx->name_to_stub.end()) {
+            return it->second;
+        }
+        return 0;
     }
 
     if (fn == "FltRegisterFilter") {
@@ -421,6 +511,34 @@ uint64_t emulate_kernel_stub(
             ctx->api->mem_write(uc, r8, &fake_filter, sizeof(fake_filter));
         }
         return 0; // STATUS_SUCCESS
+    }
+
+    if (fn == "ObRegisterCallbacks") {
+        if (rdx != 0) {
+            const uint64_t fake_ob_handle = 0x00007FF805002000ULL;
+            ctx->api->mem_write(uc, rdx, &fake_ob_handle, sizeof(fake_ob_handle));
+        }
+        return 0;
+    }
+
+    if (fn == "IoCreateDevice") {
+        uint64_t out_dev_ptr = 0;
+        if (rsp != 0 && ctx->api->mem_read(uc, rsp + 0x38ULL, &out_dev_ptr, sizeof(out_dev_ptr)) == kUcErrOk &&
+            out_dev_ptr != 0) {
+            const uint64_t ext_sz = std::min<uint64_t>(rdx, 0x10000ULL);
+            const uint64_t dev_va = alloc_pool_slice(ctx, 0x150ULL + ext_sz);
+            if (dev_va != 0) {
+                uint8_t dev_hdr[0x150]{};
+                write_u16_le(dev_hdr + 0x00, 3U); // IO_TYPE_DEVICE
+                write_u16_le(dev_hdr + 0x02, static_cast<uint16_t>(0x150U));
+                write_u64_le(dev_hdr + 0x08, rcx); // DriverObject
+                write_u64_le(dev_hdr + 0x40, (ext_sz > 0) ? (dev_va + 0x150ULL) : 0ULL); // DeviceExtension
+                write_u32_le(dev_hdr + 0x48, static_cast<uint32_t>(r9)); // DeviceType
+                ctx->api->mem_write(uc, dev_va, dev_hdr, sizeof(dev_hdr));
+                ctx->api->mem_write(uc, out_dev_ptr, &dev_va, sizeof(dev_va));
+            }
+        }
+        return 0;
     }
 
     if (fn == "NtQuerySystemInformation" || fn == "ZwQuerySystemInformation") {
@@ -443,7 +561,6 @@ uint64_t emulate_kernel_stub(
         return 0;
     }
 
-    (void)r9;
     return 0; // Default STATUS_SUCCESS / NULL-safe status
 }
 
@@ -534,12 +651,20 @@ void cb_hook_intr(uc_engine* uc, uint32_t intno, void* user_data) {
     ctx->api->emu_stop(uc);
 }
 
-void cb_hook_mem_read(uc_engine* /*uc*/, int /*type*/, uint64_t address, int /*size*/,
+void cb_hook_mem_read(uc_engine* uc, int /*type*/, uint64_t address, int /*size*/,
                       int64_t /*value*/, void* user_data) {
     const uint64_t masked52 = address & 0x000FFFFFFFFFFFFFULL;
     if ((masked52 & ~0x1FFFULL) == 0x000FF78000000000ULL) {
         auto* ctx = static_cast<SandboxRuntimeCtx*>(user_data);
         ++ctx->res->kuser_reads;
+        const uint64_t intr_time = 0x000000018A4C2B10ULL + ctx->res->kuser_reads * 10000ULL;
+        const uint64_t tick_cnt  = 0x0000000004B87F10ULL + ctx->res->kuser_reads;
+        for (uint64_t kb : {ctx->kuser_base, ctx->kuser_alias}) {
+            if (kb != 0) {
+                ctx->api->mem_write(uc, kb + 0x008, &intr_time, sizeof(intr_time));
+                ctx->api->mem_write(uc, kb + 0x320, &tick_cnt, sizeof(tick_cnt));
+            }
+        }
     }
 }
 
@@ -601,7 +726,7 @@ void cb_hook_code(uc_engine* uc, uint64_t address, uint32_t size, void* user_dat
                 ? static_cast<uint32_t>(ret_addr - ctx->mapped_base)
                 : 0U;
 
-        const uint64_t rv = emulate_kernel_stub(uc, ctx, it->second, rcx, rdx, r8, r9);
+        const uint64_t rv = emulate_kernel_stub(uc, ctx, it->second, rsp, rcx, rdx, r8, r9);
         ctx->api->reg_write(uc, kUcRegRax, &rv);
 
         if (ctx->res->stub_calls.size() < 128) {
@@ -714,14 +839,21 @@ SandboxRunResult run_wdk_driver_sandbox(
     const uint64_t mapped_base = align_down_4k(cfg.mapped_base);
     const uint64_t mapped_size = align_up_4k(pe.size_of_image());
 
+    if (res.start_rva == 0 || res.start_rva >= pe.size_of_image() || res.start_rva >= mapped_size) {
+        res.stop_reason = "entry_rva_out_of_bounds";
+        api.close(uc);
+        return res;
+    }
+
     // Build relocated in-memory image buffer
     std::vector<uint8_t> img_buf(static_cast<size_t>(mapped_size), 0);
     const auto raw = pe.raw_bytes();
-    const size_t hdr_copy = std::min<size_t>(0x1000U, raw.size());
+    const size_t hdr_copy = std::min<size_t>(0x1000U, std::min<size_t>(raw.size(), img_buf.size()));
     std::memcpy(img_buf.data(), raw.data(), hdr_copy);
 
     uint32_t text_start = 0, text_end = 0;
     uint32_t sec7_start = 0, sec7_end = 0;
+    uint32_t bearimp_start = 0, bearimp_end = 0;
     const auto& secs = pe.sections();
     for (size_t i = 0; i < secs.size(); ++i) {
         const auto& s = secs[i];
@@ -733,11 +865,15 @@ SandboxRunResult run_wdk_driver_sandbox(
             sec7_start = s.virtual_address;
             sec7_end = s.virtual_address + std::max(s.virtual_size, s.raw_size);
         }
-        if (s.raw_size > 0 && s.raw_ptr < raw.size()) {
-            const size_t avail = std::min<size_t>(s.raw_size, raw.size() - s.raw_ptr);
-            if (static_cast<size_t>(s.virtual_address) + avail <= img_buf.size()) {
-                std::memcpy(img_buf.data() + s.virtual_address, raw.data() + s.raw_ptr, avail);
-            }
+        if (s.name == ".bearimp") {
+            bearimp_start = s.virtual_address;
+            bearimp_end = s.virtual_address + std::max(s.virtual_size, s.raw_size);
+        }
+        if (s.raw_size > 0 && s.raw_ptr < raw.size() && static_cast<size_t>(s.virtual_address) < img_buf.size()) {
+            const size_t file_avail = std::min<size_t>(s.raw_size, raw.size() - s.raw_ptr);
+            const size_t mem_avail  = img_buf.size() - static_cast<size_t>(s.virtual_address);
+            const size_t copy_len   = std::min<size_t>(file_avail, mem_avail);
+            std::memcpy(img_buf.data() + s.virtual_address, raw.data() + s.raw_ptr, copy_len);
         }
     }
 
@@ -830,11 +966,11 @@ SandboxRunResult run_wdk_driver_sandbox(
         const auto dep_raw = dep.raw_bytes();
         api.mem_write(uc, mod_base, dep_raw.data(), std::min<size_t>(0x1000U, dep_raw.size()));
         for (const auto& sec : dep.sections()) {
-            if (sec.raw_size > 0 && sec.raw_ptr < dep_raw.size()) {
-                const size_t avail = std::min<size_t>(sec.raw_size, dep_raw.size() - sec.raw_ptr);
-                if (static_cast<uint64_t>(sec.virtual_address) + avail <= sz) {
-                    api.mem_write(uc, mod_base + sec.virtual_address, dep_raw.data() + sec.raw_ptr, avail);
-                }
+            if (sec.raw_size > 0 && sec.raw_ptr < dep_raw.size() && static_cast<uint64_t>(sec.virtual_address) < sz) {
+                const size_t file_avail = std::min<size_t>(sec.raw_size, dep_raw.size() - sec.raw_ptr);
+                const size_t mem_avail  = static_cast<size_t>(sz - static_cast<uint64_t>(sec.virtual_address));
+                const size_t copy_len   = std::min<size_t>(file_avail, mem_avail);
+                api.mem_write(uc, mod_base + sec.virtual_address, dep_raw.data() + sec.raw_ptr, copy_len);
             }
         }
     };
@@ -991,11 +1127,19 @@ SandboxRunResult run_wdk_driver_sandbox(
     ctx.pool_cursor = kPoolBase;
     ctx.pool_limit = kPoolBase + kPoolSize;
     ctx.dummy_ntos_base = kDummyNtos;
+    ctx.kthread_va = kKthread;
+    ctx.eprocess_va = kEprocess;
+    ctx.kuser_base = kKuserBase;
+    ctx.kuser_alias = kKuserAlias;
     ctx.max_instructions = cfg.max_instructions;
     ctx.os_build_number = cfg.os_build_number;
 
     uint64_t next_stub = kStubBase;
+    std::set<uint32_t> wired_iat_rvas;
     auto alloc_stub = [&](const std::string& mod_name, const std::string& fn_name, uint32_t iat_rva) {
+        if (iat_rva != 0 && wired_iat_rvas.count(iat_rva) != 0) {
+            return;
+        }
         if (next_stub + 16 > kStubBase + kStubSize) {
             return;
         }
@@ -1005,16 +1149,25 @@ SandboxRunResult run_wdk_driver_sandbox(
         const uint8_t stub_code[4] = {0xC3, 0xCC, 0xCC, 0xCC};
         api.mem_write(uc, addr, stub_code, sizeof(stub_code));
         ctx.addr_to_stub[addr] = StubEntryDesc{mod_name, fn_name, addr};
+        if (!fn_name.empty() && fn_name[0] != '<') {
+            ctx.name_to_stub.emplace(fn_name, addr);
+        }
 
         if (iat_rva != 0 && static_cast<uint64_t>(iat_rva) + 8 <= mapped_size) {
             api.mem_write(uc, mapped_base + iat_rva, &addr, sizeof(addr));
+            wired_iat_rvas.insert(iat_rva);
         }
     };
 
-    // Slot 0: generic fallback routine for MmGetSystemRoutineAddress
+    // Slot 0: generic fallback slot
     alloc_stub("ntoskrnl.exe", "<MmGetSystemRoutineFallback>", 0);
 
     for (const auto& imp : pe.parse_standard_imports()) {
+        const bool in_bearimp = (bearimp_end > bearimp_start) &&
+                                (imp.iat_rva >= bearimp_start && imp.iat_rva < bearimp_end);
+        if (in_bearimp && !cfg.wire_bearimp_stubs) {
+            continue;
+        }
         alloc_stub(imp.dll_name, imp.func_name, imp.iat_rva);
     }
     if (cfg.wire_bearimp_stubs) {
@@ -1049,6 +1202,9 @@ SandboxRunResult run_wdk_driver_sandbox(
                 const uint64_t target_va = mod_base + ex.rva;
                 api.mem_write(uc, target_va, &ret_byte, 1);
                 ctx.addr_to_stub[target_va] = StubEntryDesc{mod_name, ex.name, target_va};
+                if (!ex.name.empty() && ex.name[0] != '#') {
+                    ctx.name_to_stub.emplace(ex.name, target_va);
+                }
             }
         }
     };
@@ -1078,11 +1234,30 @@ SandboxRunResult run_wdk_driver_sandbox(
     api.hook_add(uc, &hh_unmap, kUcHookMemUnmapped, reinterpret_cast<void*>(&cb_hook_mem_unmapped), &ctx, 1ULL, 0ULL);
     api.hook_add(uc, &hh_code,  kUcHookCode,  reinterpret_cast<void*>(&cb_hook_code),  &ctx, 1ULL, 0ULL);
 
+    if (cfg.max_instructions == 0) {
+        res.last_rva = res.start_rva;
+        res.stop_reason = "instruction_budget_reached";
+        api.close(uc);
+        return res;
+    }
+
     const uint64_t entry_va = mapped_base + res.start_rva;
-    err = api.emu_start(uc, entry_va, kRetSent, 0ULL, static_cast<size_t>(cfg.max_instructions + 64));
+    const size_t emu_count =
+        (cfg.max_instructions > static_cast<uint64_t>(SIZE_MAX) - 64ULL)
+            ? 0U
+            : static_cast<size_t>(cfg.max_instructions + 64ULL);
+    err = api.emu_start(uc, entry_va, kRetSent, 0ULL, emu_count);
     res.uc_error_code = err;
     if (res.stop_reason.empty()) {
-        if (err == kUcErrOk) {
+        uint64_t end_rip = 0;
+        api.reg_read(uc, kUcRegRip, &end_rip);
+        if (err == kUcErrOk && end_rip == kRetSent) {
+            uint64_t rax = 0;
+            api.reg_read(uc, kUcRegRax, &rax);
+            std::ostringstream oss;
+            oss << "clean_return_ntstatus_0x" << std::hex << std::uppercase << static_cast<uint32_t>(rax);
+            res.stop_reason = oss.str();
+        } else if (err == kUcErrOk) {
             res.stop_reason = "completed_within_budget";
         } else {
             res.stop_reason = std::string("uc_err: ") + api.strerror(err);
@@ -1091,6 +1266,241 @@ SandboxRunResult run_wdk_driver_sandbox(
 
     api.close(uc);
     return res;
+}
+
+SandboxSelfTestResult run_wdk_sandbox_selftest(const SandboxConfig& base_cfg) {
+    SandboxSelfTestResult out;
+    std::vector<std::string> failures;
+    auto check = [&](bool cond, const std::string& msg) {
+        ++out.checks_total;
+        if (cond) {
+            ++out.checks_passed;
+        } else {
+            failures.push_back(msg);
+        }
+    };
+
+    // 1. Default empty PeImage must reject cleanly
+    {
+        PeImage empty_pe;
+        const auto r = run_wdk_driver_sandbox("selftest:empty", empty_pe, 0, base_cfg);
+        check(!r.mapped_ok && r.stop_reason == "unsupported_pe_format", "empty_pe_rejection");
+    }
+
+    // Build synthetic PE64 kernel driver with:
+    //   ImageBase = 0xFFFFF80511220000 (tests DIR64 rebasing -> 0x140000000)
+    //   Sec 0: .text    VA=0x1000 VS=0x1000 RawPtr=0x0400 RawSize=0x0400
+    //   Sec 1: .data    VA=0x2000 VS=0x1000 RawPtr=0x0800 RawSize=0x0400
+    //   Sec 2: .reloc   VA=0x3000 VS=0x1000 RawPtr=0x0C00 RawSize=0x0200 (oversized DD[5].Size + zero-size block sentinel)
+    //   Sec 3: .bearimp VA=0x4000 VS=0x1000 RawPtr=0x0E00 RawSize=0x0200 (MmGetSystemRoutineAddress, PsGetVersion, MmIsAddressValid)
+    constexpr uint64_t kOrigBase = 0xFFFFF80511220000ULL;
+    std::vector<uint8_t> pe_raw(0x1000, 0);
+
+    // DOS + NT headers
+    write_u16_le(pe_raw.data() + 0x00, 0x5A4DU);
+    write_u32_le(pe_raw.data() + 0x3C, 0x80U);
+    write_u32_le(pe_raw.data() + 0x80, 0x00004550U);
+    write_u16_le(pe_raw.data() + 0x84, 0x8664U); // IMAGE_FILE_MACHINE_AMD64
+    write_u16_le(pe_raw.data() + 0x86, 4U);      // NumberOfSections = 4
+    write_u16_le(pe_raw.data() + 0x94, 0xF0U);   // SizeOfOptionalHeader = 240
+    write_u16_le(pe_raw.data() + 0x96, 0x0022U);
+
+    uint8_t* opt = pe_raw.data() + 0x98;
+    write_u16_le(opt + 0x00, 0x20BU);            // PE32+
+    write_u32_le(opt + 0x10, 0x1000U);           // AddressOfEntryPoint
+    write_u64_le(opt + 0x18, kOrigBase);         // ImageBase
+    write_u32_le(opt + 0x20, 0x1000U);           // SectionAlignment
+    write_u32_le(opt + 0x24, 0x0200U);           // FileAlignment
+    write_u32_le(opt + 0x38, 0x5000U);           // SizeOfImage
+    write_u32_le(opt + 0x3C, 0x0400U);           // SizeOfHeaders
+    write_u32_le(opt + 0x6C, 16U);               // NumberOfRvaAndSizes
+    // DataDirectory[5] (.reloc): intentionally oversized Size (0x9000 > SizeOfImage) to test clamping
+    write_u32_le(opt + 0x70 + 5 * 8 + 0, 0x3000U);
+    write_u32_le(opt + 0x70 + 5 * 8 + 4, 0x9000U);
+
+    auto write_sec = [&](size_t idx, const char* nm, uint32_t vs, uint32_t va, uint32_t rs, uint32_t rp, uint32_t ch) {
+        uint8_t* sh = pe_raw.data() + 0x188 + idx * 40;
+        std::memcpy(sh, nm, std::min<size_t>(8, std::strlen(nm)));
+        write_u32_le(sh + 8, vs);
+        write_u32_le(sh + 12, va);
+        write_u32_le(sh + 16, rs);
+        write_u32_le(sh + 20, rp);
+        write_u32_le(sh + 36, ch);
+    };
+    write_sec(0, ".text",    0x1000U, 0x1000U, 0x0400U, 0x0400U, 0x60000020U);
+    write_sec(1, ".data",    0x1000U, 0x2000U, 0x0400U, 0x0800U, 0xC0000040U);
+    write_sec(2, ".reloc",   0x1000U, 0x3000U, 0x0200U, 0x0C00U, 0x42000040U);
+    write_sec(3, ".bearimp", 0x1000U, 0x4000U, 0x0200U, 0x0E00U, 0xC0000040U);
+
+    // Populate .data (file offset 0x800 -> RVA 0x2000)
+    uint8_t* dsec = pe_raw.data() + 0x800;
+    write_u64_le(dsec + 0x000, kOrigBase + 0x2100ULL); // Relocated pointer to magic qword
+    const wchar_t* w_exalloc = L"ExAllocatePool2";
+    const uint16_t exalloc_bytes = static_cast<uint16_t>(std::wcslen(w_exalloc) * 2U);
+    write_u16_le(dsec + 0x020, exalloc_bytes);
+    write_u16_le(dsec + 0x022, static_cast<uint16_t>(exalloc_bytes + 2U));
+    write_u64_le(dsec + 0x028, kOrigBase + 0x2040ULL); // Relocated UNICODE_STRING.Buffer
+    std::memcpy(dsec + 0x040, w_exalloc, exalloc_bytes + 2U);
+
+    const wchar_t* w_bogus = L"NoSuchKernelApiZzz";
+    const uint16_t bogus_bytes = static_cast<uint16_t>(std::wcslen(w_bogus) * 2U);
+    write_u16_le(dsec + 0x080, bogus_bytes);
+    write_u16_le(dsec + 0x082, static_cast<uint16_t>(bogus_bytes + 2U));
+    write_u64_le(dsec + 0x088, kOrigBase + 0x20A0ULL); // Relocated UNICODE_STRING.Buffer
+    std::memcpy(dsec + 0x0A0, w_bogus, bogus_bytes + 2U);
+
+    constexpr uint64_t kRelocMagic = 0xCAFEBABE12345678ULL;
+    write_u64_le(dsec + 0x100, kRelocMagic);
+
+    // Populate .reloc (file offset 0xC00 -> RVA 0x3000)
+    uint8_t* rsec = pe_raw.data() + 0xC00;
+    write_u32_le(rsec + 0x00, 0x2000U); // PageRVA
+    write_u32_le(rsec + 0x04, 16U);     // SizeOfBlock (8 + 4*2)
+    write_u16_le(rsec + 0x08, static_cast<uint16_t>((10U << 12) | 0x000U));
+    write_u16_le(rsec + 0x0A, static_cast<uint16_t>((10U << 12) | 0x028U));
+    write_u16_le(rsec + 0x0C, static_cast<uint16_t>((10U << 12) | 0x088U));
+    write_u16_le(rsec + 0x0E, 0U); // IMAGE_REL_BASED_ABSOLUTE padding
+    // Malformed trailing block with block_sz = 0 to verify loop termination
+    write_u32_le(rsec + 0x10, 0x2000U);
+    write_u32_le(rsec + 0x14, 0U);
+
+    // Populate .bearimp (file offset 0xE00 -> RVA 0x4000)
+    uint8_t* bsec = pe_raw.data() + 0xE00;
+    write_u32_le(bsec + 0x00, 0x4040U); // OriginalFirstThunk
+    write_u32_le(bsec + 0x0C, 0x4090U); // Name ("ntoskrnl.exe")
+    write_u32_le(bsec + 0x10, 0x4060U); // FirstThunk (IAT: 0x4060, 0x4068, 0x4070, 0x4078)
+    const uint32_t ibns[4] = {0x40A0U, 0x40C8U, 0x40E0U, 0x4100U};
+    for (size_t i = 0; i < 4; ++i) {
+        write_u64_le(bsec + 0x40 + i * 8, ibns[i]);
+        write_u64_le(bsec + 0x60 + i * 8, ibns[i]);
+    }
+    std::strcpy(reinterpret_cast<char*>(bsec + 0x90), "ntoskrnl.exe");
+    std::strcpy(reinterpret_cast<char*>(bsec + 0xA0 + 2), "MmGetSystemRoutineAddress");
+    std::strcpy(reinterpret_cast<char*>(bsec + 0xC8 + 2), "PsGetVersion");
+    std::strcpy(reinterpret_cast<char*>(bsec + 0xE0 + 2), "MmIsAddressValid");
+    std::strcpy(reinterpret_cast<char*>(bsec + 0x100 + 2), "IoGetCurrentProcess");
+
+    // Emit x86_64 test routine into .text (file offset 0x400 -> RVA 0x1000)
+    std::vector<uint8_t> code;
+    auto push_bytes = [&](std::initializer_list<uint8_t> bs) { code.insert(code.end(), bs); };
+    auto emit_disp32 = [&](uint32_t target_rva) {
+        const int32_t disp = static_cast<int32_t>(target_rva) - static_cast<int32_t>(0x1000U + code.size() + 4U);
+        uint8_t b[4];
+        std::memcpy(b, &disp, 4);
+        code.insert(code.end(), b, b + 4);
+    };
+    std::vector<size_t> fail_jcc_patches;
+    auto emit_jcc_fail = [&](uint8_t jcc_op) {
+        push_bytes({0x0F, jcc_op});
+        fail_jcc_patches.push_back(code.size());
+        push_bytes({0, 0, 0, 0});
+    };
+
+    // sub rsp, 0x38
+    push_bytes({0x48, 0x83, 0xEC, 0x38});
+    // 1) Verify DIR64 relocation: rcx = [0x2000], MmIsAddressValid(rcx) == 1, and [rcx] == kRelocMagic
+    push_bytes({0x48, 0x8B, 0x0D}); emit_disp32(0x2000U); // mov rcx, [rip+0x2000]
+    push_bytes({0xFF, 0x15});       emit_disp32(0x4070U); // call [MmIsAddressValid]
+    push_bytes({0x83, 0xF8, 0x01});                       // cmp eax, 1
+    emit_jcc_fail(0x85);                                  // jne fail
+    push_bytes({0x48, 0x8B, 0x05}); emit_disp32(0x2000U); // mov rax, [rip+0x2000]
+    push_bytes({0x48, 0x8B, 0x00});                       // mov rax, [rax]
+    push_bytes({0x48, 0xB9});
+    for (int s = 0; s < 64; s += 8) code.push_back(static_cast<uint8_t>((kRelocMagic >> s) & 0xFFU));
+    push_bytes({0x48, 0x39, 0xC8});                       // cmp rax, rcx
+    emit_jcc_fail(0x85);                                  // jne fail
+
+    // 2) Verify MmGetSystemRoutineAddress(L"NoSuchKernelApiZzz") == NULL
+    push_bytes({0x48, 0x8D, 0x0D}); emit_disp32(0x2080U); // lea rcx, [ustr_bogus]
+    push_bytes({0xFF, 0x15});       emit_disp32(0x4060U); // call [MmGetSystemRoutineAddress]
+    push_bytes({0x48, 0x85, 0xC0});                       // test rax, rax
+    emit_jcc_fail(0x85);                                  // jnz fail
+
+    // 3) Verify MmGetSystemRoutineAddress(L"ExAllocatePool2") != NULL, then call it dynamically & probe pool ptr
+    push_bytes({0x48, 0x8D, 0x0D}); emit_disp32(0x2020U); // lea rcx, [ustr_exalloc]
+    push_bytes({0xFF, 0x15});       emit_disp32(0x4060U); // call [MmGetSystemRoutineAddress]
+    push_bytes({0x48, 0x85, 0xC0});                       // test rax, rax
+    emit_jcc_fail(0x84);                                  // jz fail
+    push_bytes({0xB9, 0x00, 0x01, 0x00, 0x00});           // mov ecx, 0x100 (Flags)
+    push_bytes({0xBA, 0x00, 0x02, 0x00, 0x00});           // mov edx, 0x200 (NumberOfBytes)
+    push_bytes({0x41, 0xB8, 0x74, 0x63, 0x61, 0x45});     // mov r8d, 'Eact'
+    push_bytes({0xFF, 0xD0});                             // call rax (ExAllocatePool2)
+    push_bytes({0x48, 0x85, 0xC0});                       // test rax, rax
+    emit_jcc_fail(0x84);                                  // jz fail
+    push_bytes({0x48, 0x89, 0xC1});                       // mov rcx, rax
+    push_bytes({0xFF, 0x15});       emit_disp32(0x4070U); // call [MmIsAddressValid]
+    push_bytes({0x83, 0xF8, 0x01});                       // cmp eax, 1
+    emit_jcc_fail(0x85);                                  // jne fail
+
+    // 4) Verify IoGetCurrentProcess() != NULL and PsGetVersion writes os_build_number
+    push_bytes({0xFF, 0x15});       emit_disp32(0x4078U); // call [IoGetCurrentProcess]
+    push_bytes({0x48, 0x85, 0xC0});                       // test rax, rax
+    emit_jcc_fail(0x84);                                  // jz fail
+    push_bytes({0x48, 0x8D, 0x4C, 0x24, 0x20});           // lea rcx, [rsp+0x20]
+    push_bytes({0x48, 0x8D, 0x54, 0x24, 0x24});           // lea rdx, [rsp+0x24]
+    push_bytes({0x4C, 0x8D, 0x44, 0x24, 0x28});           // lea r8,  [rsp+0x28]
+    push_bytes({0x45, 0x31, 0xC9});                       // xor r9d, r9d
+    push_bytes({0xFF, 0x15});       emit_disp32(0x4068U); // call [PsGetVersion]
+    push_bytes({0x81, 0x7C, 0x24, 0x28});                 // cmp dword ptr [rsp+0x28], os_build_number
+    uint8_t bld_le[4];
+    write_u32_le(bld_le, base_cfg.os_build_number);
+    code.insert(code.end(), bld_le, bld_le + 4);
+    emit_jcc_fail(0x85);                                  // jne fail
+
+    // Success epilogue: xor eax, eax; add rsp, 0x38; ret
+    push_bytes({0x31, 0xC0, 0x48, 0x83, 0xC4, 0x38, 0xC3});
+
+    const size_t fail_off = code.size();
+    // Fail epilogue: mov eax, 0xC0000001; add rsp, 0x38; ret
+    push_bytes({0xB8, 0x01, 0x00, 0x00, 0xC0, 0x48, 0x83, 0xC4, 0x38, 0xC3});
+
+    for (size_t patch_pos : fail_jcc_patches) {
+        const int32_t rel = static_cast<int32_t>(fail_off) - static_cast<int32_t>(patch_pos + 4U);
+        std::memcpy(code.data() + patch_pos, &rel, 4);
+    }
+    std::memcpy(pe_raw.data() + 0x400, code.data(), code.size());
+
+    std::string parse_err;
+    const auto synth_pe = PeImage::load_from_bytes(std::move(pe_raw), "<synth_wdk_selftest.sys>", &parse_err);
+    check(synth_pe.has_value(), "synth_pe_parse: " + parse_err);
+
+    if (synth_pe.has_value()) {
+        // 2. Out-of-bounds start_rva rejection
+        const auto oob_res = run_wdk_driver_sandbox("selftest:oob_entry", *synth_pe, 0x0FFFFFFFU, base_cfg);
+        check(!oob_res.mapped_ok && oob_res.stop_reason == "entry_rva_out_of_bounds",
+              "oob_entry_rejection (" + oob_res.stop_reason + ")");
+
+        // 3. Zero instruction budget boundary
+        SandboxConfig zero_cfg = base_cfg;
+        zero_cfg.max_instructions = 0;
+        const auto zero_res = run_wdk_driver_sandbox("selftest:zero_budget", *synth_pe, 0, zero_cfg);
+        check(zero_res.mapped_ok && zero_res.instructions_executed == 0 &&
+              zero_res.basic_blocks_entered == 0 && zero_res.stop_reason == "instruction_budget_reached",
+              "zero_budget_boundary");
+
+        // 4. Full synthetic driver execution (relocs + malformed reloc guard + .bearimp + MmGetSystemRoutineAddress + pool + PsGetVersion)
+        SandboxConfig run_cfg = base_cfg;
+        run_cfg.max_instructions = 256;
+        const auto sr = run_wdk_driver_sandbox("selftest:wdk_full", *synth_pe, 0, run_cfg);
+        check(sr.relocations_applied == 3, "relocations_applied==3 (got " + std::to_string(sr.relocations_applied) + ")");
+        check(sr.stub_calls.size() == 7, "stub_calls==7 (got " + std::to_string(sr.stub_calls.size()) + ")");
+        check(sr.stop_reason == "clean_return_ntstatus_0x0", "clean_return_ntstatus_0x0 (got " + sr.stop_reason + ")");
+    }
+
+    out.passed = failures.empty() && (out.checks_passed == out.checks_total);
+    if (out.passed) {
+        out.detail = "All " + std::to_string(out.checks_passed) + "/" + std::to_string(out.checks_total) +
+                     " WDM sandbox edge & stub assertions passed";
+    } else {
+        std::ostringstream oss;
+        oss << "Failed (" << out.checks_passed << "/" << out.checks_total << "): ";
+        for (size_t i = 0; i < failures.size(); ++i) {
+            if (i > 0) oss << "; ";
+            oss << failures[i];
+        }
+        out.detail = oss.str();
+    }
+    return out;
 }
 
 std::string format_sandbox_markdown(const std::vector<SandboxRunResult>& runs) {

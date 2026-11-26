@@ -167,14 +167,28 @@ std::optional<PeImage> PeImage::load_from_file(const std::string& path, std::str
         return std::nullopt;
     }
 
-    PeImage img;
-    img.path_ = path;
-    img.data_.resize(static_cast<size_t>(file_sz));
+    std::vector<uint8_t> raw(static_cast<size_t>(file_sz));
     ifs.seekg(0, std::ios::beg);
-    if (!ifs.read(reinterpret_cast<char*>(img.data_.data()), file_sz)) {
+    if (!ifs.read(reinterpret_cast<char*>(raw.data()), file_sz)) {
         if (err) *err = "Short read while loading file: " + path;
         return std::nullopt;
     }
+
+    return load_from_bytes(std::move(raw), path, err);
+}
+
+std::optional<PeImage> PeImage::load_from_bytes(
+    std::vector<uint8_t> bytes,
+    const std::string& path,
+    std::string* err) {
+    if (bytes.size() < 0x100) {
+        if (err) *err = "Buffer too small to be a valid PE image: " + path;
+        return std::nullopt;
+    }
+
+    PeImage img;
+    img.path_ = path;
+    img.data_ = std::move(bytes);
 
     if (read_u16_le(img.data_.data()) != 0x5A4DU) {
         if (err) *err = "Missing MZ signature: " + path;

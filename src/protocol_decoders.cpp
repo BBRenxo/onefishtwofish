@@ -243,11 +243,15 @@ std::string format_protocol_markdown(
     md << "- **Sizes Verified**: `" << cipher_test.tested_sizes << "` (`" << cipher_test.detail << "`)\n\n";
 
     md << "### 2. Signed Integrity Catalog (`Certificates/base.bin`)\n";
-    md << "- **Header Magic Valid (`\"EAC\\0\"`)**: `" << (catalog_info.valid_magic ? "true" : "false") << "`\n";
-    md << "- **Catalog Version**: `" << catalog_info.version << "`\n";
-    md << "- **Size**: `" << catalog_info.total_size << "` bytes\n";
-    md << "- **SHA-256**: `" << catalog_info.sha256 << "`\n";
-    md << "- **Header (32 bytes)**: `" << catalog_info.header_hex << "`\n\n";
+    if (catalog_info.total_size == 0 && !catalog_info.valid_magic) {
+        md << "- **Status**: `SKIPPED` (optional host file absent on this machine)\n\n";
+    } else {
+        md << "- **Header Magic Valid (`\"EAC\\0\"`)**: `" << (catalog_info.valid_magic ? "true" : "false") << "`\n";
+        md << "- **Catalog Version**: `" << catalog_info.version << "`\n";
+        md << "- **Size**: `" << catalog_info.total_size << "` bytes\n";
+        md << "- **SHA-256**: `" << catalog_info.sha256 << "`\n";
+        md << "- **Header (32 bytes)**: `" << catalog_info.header_hex << "`\n\n";
+    }
 
     if (service_v159 != nullptr && service_v153_bak != nullptr) {
         auto count_by_dll = [](const PeImage& pe) {
@@ -281,13 +285,17 @@ std::string format_protocol_markdown(
     md << "### 4. `EOSSDK-Win64-Shipping.dll` Anti-Cheat Exports (`"
        << eossdk_report.client_export_count << "` Client, `"
        << eossdk_report.server_export_count << "` Server)\n\n";
-    md << "| Export Name | Ordinal | RVA |\n";
-    md << "|---|---|---|\n";
-    for (const auto& exp : eossdk_report.client_exports) {
-        md << "| `" << exp.name << "` | `" << exp.ordinal << "` | `0x"
-           << std::hex << std::setw(7) << std::setfill('0') << exp.rva << std::dec << "` |\n";
+    if (eossdk_report.client_export_count == 0 && eossdk_report.server_export_count == 0) {
+        md << "- **Status**: `SKIPPED` (optional host `EOSSDK-Win64-Shipping.dll` absent on this machine)\n\n";
+    } else {
+        md << "| Export Name | Ordinal | RVA |\n";
+        md << "|---|---|---|\n";
+        for (const auto& exp : eossdk_report.client_exports) {
+            md << "| `" << exp.name << "` | `" << exp.ordinal << "` | `0x"
+               << std::hex << std::setw(7) << std::setfill('0') << exp.rva << std::dec << "` |\n";
+        }
+        md << "\n";
     }
-    md << "\n";
     return md.str();
 }
 

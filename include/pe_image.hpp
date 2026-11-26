@@ -41,6 +41,10 @@ struct PdataEntry {
 class PeImage {
 public:
     static std::optional<PeImage> load_from_file(const std::string& path, std::string* err = nullptr);
+    static std::optional<PeImage> load_from_bytes(
+        std::vector<uint8_t> bytes,
+        const std::string& virtual_path = "<memory>",
+        std::string* err = nullptr);
 
     const std::string& path() const noexcept { return path_; }
     std::span<const uint8_t> raw_bytes() const noexcept { return data_; }

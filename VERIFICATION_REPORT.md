@@ -3,8 +3,8 @@
 - **Overall Verification Status**: `PASS (Exit 0)`
 - **Kernel RVA & Opcode Assertions Passed**: `34 / 34`
 - **Rolling Cipher Algebraic Round-Trip Self-Test**: `PASS` (`11` payload sizes)
-- **Signed Integrity Catalog (`base.bin`)**: `INVALID` (`v0`, `0` B, SHA-256 ``)
-- **WDM Kernel Sandbox Emulation (`wdk_sandbox`)**: `6` PE64 drivers emulated via `unicorn.dll`
+- **Signed Integrity Catalog (`base.bin`)**: `SKIPPED` (optional host file absent)
+- **WDM Kernel Sandbox Emulation (`wdk_sandbox`)**: `7` runs via `unicorn.dll` (`7/7` synthetic WDK/relocation assertions `PASS`)
 
 ## 1. Measured PE32 / PE32+ Binary Inventory
 
@@ -319,11 +319,7 @@
 - **Sizes Verified**: `11` (`Bit-exact round-trip verified across 11 buffer sizes (0..4096, odd & even)`)
 
 ### 2. Signed Integrity Catalog (`Certificates/base.bin`)
-- **Header Magic Valid (`"EAC\0"`)**: `false`
-- **Catalog Version**: `0`
-- **Size**: `0` bytes
-- **SHA-256**: ``
-- **Header (32 bytes)**: ``
+- **Status**: `SKIPPED` (optional host file absent on this machine)
 
 ### 3. Service Binary Evolution (`EasyAntiCheat_EOS.exe` v1.5.9 vs v1.5.3 `.bak`)
 
@@ -338,8 +334,7 @@
 
 ### 4. `EOSSDK-Win64-Shipping.dll` Anti-Cheat Exports (`0` Client, `0` Server)
 
-| Export Name | Ordinal | RVA |
-|---|---|---|
+- **Status**: `SKIPPED` (optional host `EOSSDK-Win64-Shipping.dll` absent on this machine)
 
 ## WDM Kernel Driver Sandbox Emulation (`wdk_sandbox` — C++20 + Unicorn x86_64)
 
@@ -352,7 +347,8 @@ Full PE64 image mapping at `0x0000000140000000` with `IMAGE_REL_BASED_DIR64` bas
 | `eacfn` | `0x266478` | `0x188AEEE` | `100000` | `397` | `99603` | `1021` | `6036` | `1` | `2` | `0` | `0` | `instruction_budget_reached` |
 | `eos_prior` | `0x255638` | `0x118B51E` | `100000` | `307` | `99693` | `998` | `0` | `0` | `2` | `0` | `0` | `instruction_budget_reached` |
 | `eos_live:cpuid_leaf` | `0xFD37` | `0x27C3C4` | `32` | `32` | `0` | `7` | `0` | `0` | `0` | `1` | `0` | `instruction_budget_reached` |
-| `eos_live:kuser_2ec` | `0x1D19B7` | `0x1D19C3` | `3` | `3` | `0` | `1` | `0` | `0` | `1` | `0` | `0` | `completed_within_budget` |
+| `eos_live:kuser_2ec` | `0x1D19B7` | `0x1D19C3` | `3` | `3` | `0` | `1` | `0` | `0` | `1` | `0` | `0` | `clean_return_ntstatus_0x200` |
+| `eos_live:flt_register` | `0x27C400` | `0x27C400` | `1` | `1` | `0` | `2` | `0` | `0` | `0` | `0` | `1` | `clean_return_ntstatus_0x0` |
 
 ### Sandbox Run: `eos_live` (`C:\Program Files (x86)\EasyAntiCheat_EOS\EasyAntiCheat_EOS.sys`)
 
@@ -599,5 +595,19 @@ step=  24 RVA=0x027C229 [.text]  740d
 step=   1 RVA=0x01D19B7 [.text]  48b8ec02000080f7ffff
 step=   2 RVA=0x01D19C1 [.text]  8a00
 step=   3 RVA=0x01D19C3 [.text]  c3
+```
+
+### Sandbox Run: `eos_live:flt_register` (`C:\Program Files (x86)\EasyAntiCheat_EOS\EasyAntiCheat_EOS.sys`)
+
+#### Intercepted Kernel Import Trampoline Calls (`1`)
+
+| Step | Caller RVA | Module | Function | `RCX` | `RDX` | `R8` | Return (`RAX`) |
+|---|---|---|---|---|---|---|---|
+| `1` | `0x0` | `FLTMGR.SYS` | `FltRegisterFilter` | `0x7FF802001000` | `0x7FF802002000` | `0x0` | `0x0` |
+
+#### Sample Execution Trace (`GsDriverEntry` -> `Sec[7]` Transition)
+
+```text
+step=   1 RVA=0x027C400 [.text]  ff25721a0a00
 ```
 

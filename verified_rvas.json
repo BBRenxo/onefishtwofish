@@ -8,10 +8,17 @@
     "detail": "Bit-exact round-trip verified across 11 buffer sizes (0..4096, odd & even)"
   },
   "base_bin_catalog": {
+    "present": false,
     "valid_magic": false,
     "version": 0,
     "total_size": 0,
     "sha256": ""
+  },
+  "wdk_sandbox_selftest": {
+    "passed": true,
+    "checks_passed": 7,
+    "checks_total": 7,
+    "detail": "All 7/7 WDM sandbox edge & stub assertions passed"
   },
   "binaries": [
     {
@@ -387,7 +394,22 @@
       "kuser_reads": 1,
       "cpuid_events": 0,
       "stub_calls": 0,
-      "stop_reason": "completed_within_budget"
+      "stop_reason": "clean_return_ntstatus_0x200"
+    },
+    {
+      "label": "eos_live:flt_register",
+      "start_rva": "0x27C400",
+      "last_rva": "0x27C400",
+      "instructions_executed": 1,
+      "text_instructions": 1,
+      "sec7_instructions": 0,
+      "basic_blocks_entered": 2,
+      "relocations_applied": 0,
+      "auto_mapped_pages": 0,
+      "kuser_reads": 0,
+      "cpuid_events": 0,
+      "stub_calls": 1,
+      "stop_reason": "clean_return_ntstatus_0x0"
     }
   ]
 }

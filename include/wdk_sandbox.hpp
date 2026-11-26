@@ -61,11 +61,20 @@ struct SandboxConfig {
     uint32_t os_build_number = 26100;
 };
 
+struct SandboxSelfTestResult {
+    bool passed = false;
+    size_t checks_passed = 0;
+    size_t checks_total = 0;
+    std::string detail;
+};
+
 SandboxRunResult run_wdk_driver_sandbox(
     const std::string& label,
     const PeImage& pe,
     uint32_t start_rva,
     const SandboxConfig& cfg = {});
+
+SandboxSelfTestResult run_wdk_sandbox_selftest(const SandboxConfig& cfg = {});
 
 std::string format_sandbox_markdown(const std::vector<SandboxRunResult>& runs);
 

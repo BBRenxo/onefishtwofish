@@ -70,18 +70,44 @@ int main(int argc, char** argv) {
         const std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
             help_only = true;
+        } else if (arg == "--inventory" || arg == "--verify") {
+            // Standard static inventory + RVA verification (runs by default)
         } else if (arg == "--generate-report" || arg == "--all") {
             write_reports = true;
             run_emulation = true;
         } else if (arg == "--emulate") {
             run_emulation = true;
-        } else if (arg == "--max-insns" && i + 1 < argc) {
-            max_sandbox_insns = std::stoull(argv[++i]);
+        } else if (arg == "--max-insns") {
+            if (i + 1 >= argc) {
+                std::cerr << "[CLI ERROR] Missing integer value after --max-insns\n";
+                return 1;
+            }
+            const std::string val_str = argv[++i];
+            if (val_str.empty() || val_str[0] == '-') {
+                std::cerr << "[CLI ERROR] Invalid negative or empty --max-insns value: " << val_str << "\n";
+                return 1;
+            }
+            try {
+                size_t parsed_pos = 0;
+                max_sandbox_insns = std::stoull(val_str, &parsed_pos, 0);
+                if (parsed_pos != val_str.size()) {
+                    std::cerr << "[CLI ERROR] Trailing non-numeric characters in --max-insns: " << val_str << "\n";
+                    return 1;
+                }
+            } catch (const std::exception&) {
+                std::cerr << "[CLI ERROR] Invalid integer for --max-insns: " << val_str << "\n";
+                return 1;
+            }
             run_emulation = true;
-        } else if (arg == "--out-dir" && i + 1 < argc) {
+        } else if (arg == "--out-dir") {
+            if (i + 1 >= argc) {
+                std::cerr << "[CLI ERROR] Missing directory path after --out-dir\n";
+                return 1;
+            }
             out_dir = argv[++i];
-            write_reports = true;
-            run_emulation = true;
+        } else {
+            std::cerr << "[CLI ERROR] Unknown CLI option: " << arg << "\n";
+            return 1;
         }
     }
     if (argc == 1) {
@@ -90,7 +116,7 @@ int main(int argc, char** argv) {
     }
 
     if (help_only) {
-        std::cout << "Usage: eac_inspector [--inventory] [--verify] [--emulate] [--generate-report] [--out-dir <dir>]\n";
+        std::cout << "Usage: eac_inspector [--inventory] [--verify] [--emulate] [--max-insns <N>] [--generate-report] [--out-dir <dir>]\n";
         return 0;
     }
 
@@ -225,19 +251,19 @@ int main(int argc, char** argv) {
     if (const auto it = key_to_idx.find("service_v159"); it != key_to_idx.end()) p_v159 = &loaded[it->second].pe;
     if (const auto it = key_to_idx.find("service_v153"); it != key_to_idx.end()) p_v153 = &loaded[it->second].pe;
 
+    eac::SandboxSelfTestResult sb_selftest;
     std::vector<eac::SandboxRunResult> sandbox_runs;
     if (run_emulation) {
-        // Edge-case self-check: default-constructed empty PeImage must reject cleanly without crashing
-        {
-            eac::PeImage empty_pe;
-            const auto empty_res = eac::run_wdk_driver_sandbox("empty_edge_check", empty_pe, 0);
-            if (empty_res.mapped_ok || empty_res.stop_reason != "unsupported_pe_format") {
-                all_ok = false;
-                std::cerr << "[SANDBOX FAIL] empty PeImage edge-case check failed\n";
-            }
-        }
         eac::SandboxConfig sb_cfg;
         sb_cfg.max_instructions = max_sandbox_insns;
+        sb_selftest = eac::run_wdk_sandbox_selftest(sb_cfg);
+        if (!sb_selftest.passed) {
+            all_ok = false;
+            std::cerr << "[SANDBOX FAIL] Self-test failed: " << sb_selftest.detail << "\n";
+        } else {
+            std::cout << "[OK] Sandbox self-test passed (" << sb_selftest.checks_passed
+                      << "/" << sb_selftest.checks_total << "): " << sb_selftest.detail << "\n";
+        }
         for (const auto& lt : loaded) {
             if (!lt.spec.is_kernel_driver) {
                 continue;
@@ -281,9 +307,9 @@ int main(int argc, char** argv) {
                 }
                 auto kuser_res = eac::run_wdk_driver_sandbox(
                     "eos_live:kuser_2ec", loaded[it->second].pe, 0x1D19B7U, micro_cfg);
-                if (kuser_res.kuser_reads == 0) {
+                if (kuser_res.kuser_reads == 0 || kuser_res.stop_reason.rfind("clean_return_ntstatus_", 0) != 0) {
                     all_ok = false;
-                    std::cerr << "[SANDBOX FAIL] kuser_2ec read hook did not fire\n";
+                    std::cerr << "[SANDBOX FAIL] kuser_2ec read hook or clean return failed (" << kuser_res.stop_reason << ")\n";
                 } else {
                     std::cout << "[OK] Sandbox " << std::left << std::setw(18) << kuser_res.label
                               << " insns=" << std::setw(7) << kuser_res.instructions_executed
@@ -291,6 +317,20 @@ int main(int argc, char** argv) {
                               << " stop=" << kuser_res.stop_reason << "\n";
                 }
                 sandbox_runs.push_back(std::move(kuser_res));
+
+                auto flt_res = eac::run_wdk_driver_sandbox(
+                    "eos_live:flt_register", loaded[it->second].pe, 0x27C400U, micro_cfg);
+                if (flt_res.stub_calls.empty() || flt_res.stub_calls[0].func_name != "FltRegisterFilter" ||
+                    flt_res.stop_reason != "clean_return_ntstatus_0x0") {
+                    all_ok = false;
+                    std::cerr << "[SANDBOX FAIL] flt_register IAT stub trampoline check failed (" << flt_res.stop_reason << ")\n";
+                } else {
+                    std::cout << "[OK] Sandbox " << std::left << std::setw(18) << flt_res.label
+                              << " insns=" << std::setw(7) << flt_res.instructions_executed
+                              << " stubs=" << std::setw(3) << flt_res.stub_calls.size()
+                              << " stop=" << flt_res.stop_reason << "\n";
+                }
+                sandbox_runs.push_back(std::move(flt_res));
             }
         }
     }
@@ -322,10 +362,16 @@ int main(int argc, char** argv) {
         md << "- **Kernel RVA & Opcode Assertions Passed**: `" << passed_checks << " / " << total_checks << "`\n";
         md << "- **Rolling Cipher Algebraic Round-Trip Self-Test**: `" << (cipher_res.passed ? "PASS" : "FAIL")
            << "` (`" << cipher_res.tested_sizes << "` payload sizes)\n";
-        md << "- **Signed Integrity Catalog (`base.bin`)**: `" << (catalog_info.valid_magic ? "VALID" : "INVALID")
-           << "` (`v" << catalog_info.version << "`, `" << catalog_info.total_size << "` B, SHA-256 `" << catalog_info.sha256 << "`)\n";
+        if (!base_bin_exists) {
+            md << "- **Signed Integrity Catalog (`base.bin`)**: `SKIPPED` (optional host file absent)\n";
+        } else {
+            md << "- **Signed Integrity Catalog (`base.bin`)**: `" << (catalog_info.valid_magic ? "VALID" : "INVALID")
+               << "` (`v" << catalog_info.version << "`, `" << catalog_info.total_size << "` B, SHA-256 `" << catalog_info.sha256 << "`)\n";
+        }
         if (!sandbox_runs.empty()) {
-            md << "- **WDM Kernel Sandbox Emulation (`wdk_sandbox`)**: `" << sandbox_runs.size() << "` PE64 drivers emulated via `unicorn.dll`\n";
+            md << "- **WDM Kernel Sandbox Emulation (`wdk_sandbox`)**: `" << sandbox_runs.size()
+               << "` runs via `unicorn.dll` (`" << sb_selftest.checks_passed << "/" << sb_selftest.checks_total
+               << "` synthetic WDK/relocation assertions `" << (sb_selftest.passed ? "PASS" : "FAIL") << "`)\n";
         }
         md << "\n";
 
@@ -405,10 +451,17 @@ int main(int argc, char** argv) {
         js << "    \"detail\": \"" << json_escape(cipher_res.detail) << "\"\n";
         js << "  },\n";
         js << "  \"base_bin_catalog\": {\n";
+        js << "    \"present\": " << (base_bin_exists ? "true" : "false") << ",\n";
         js << "    \"valid_magic\": " << (catalog_info.valid_magic ? "true" : "false") << ",\n";
         js << "    \"version\": " << catalog_info.version << ",\n";
         js << "    \"total_size\": " << catalog_info.total_size << ",\n";
         js << "    \"sha256\": \"" << json_escape(catalog_info.sha256) << "\"\n";
+        js << "  },\n";
+        js << "  \"wdk_sandbox_selftest\": {\n";
+        js << "    \"passed\": " << (sb_selftest.passed ? "true" : "false") << ",\n";
+        js << "    \"checks_passed\": " << sb_selftest.checks_passed << ",\n";
+        js << "    \"checks_total\": " << sb_selftest.checks_total << ",\n";
+        js << "    \"detail\": \"" << json_escape(sb_selftest.detail) << "\"\n";
         js << "  },\n";
         js << "  \"binaries\": [\n";
         for (size_t i = 0; i < loaded.size(); ++i) {
