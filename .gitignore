@@ -5,6 +5,7 @@ __pycache__/
 *.exe
 *.dll
 *.sys
+!samples/*.sys
 *.o
 *.obj
 *.pdb

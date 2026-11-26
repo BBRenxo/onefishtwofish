@@ -10,6 +10,7 @@ add_executable(eac_inspector
     src/pe_image.cpp
     src/sig_scanner.cpp
     src/protocol_decoders.cpp
+    src/wdk_sandbox.cpp
 )
 
 target_include_directories(eac_inspector PRIVATE
