@@ -1,0 +1,9 @@
+[2026-11-25 18:14:41] START eac_devirt_runner (v3 cross-build verified + DriverEntry + Affine Solver)
+[2026-11-25 18:14:41] WROTE C:\Users\Administrator\Desktop\eac_reversal\devirt\ioctl_storage_query_property.md (total=149, arith=20, mem=111, branch=9, exit=1)
+[2026-11-25 18:14:41] WROTE C:\Users\Administrator\Desktop\eac_reversal\devirt\smart_rcv_drive_data.md (total=220, arith=147, mem=59, branch=0, exit=1)
+[2026-11-25 18:14:41] RSMB immediate hits: eac_dumped=0x2d458c, eacfn=0x2c5c8c, eos_44m=0x2be27c, eos_live=0x303b74
+[2026-11-25 18:14:41] WROTE C:\Users\Administrator\Desktop\eac_reversal\devirt\rsmb_smbios_read.md (total=28, arith=11, mem=9, branch=0, exit=1)
+[2026-11-25 18:14:41] WROTE C:\Users\Administrator\Desktop\eac_reversal\devirt\kuser_shared_data_reads.md (total=79, arith=18, mem=31, branch=9, exit=1)
+[2026-11-25 18:14:41] WROTE C:\Users\Administrator\Desktop\eac_reversal\devirt\driver_entry_and_init.md (total=320, arith=42, mem=176, branch=44, exit=1)
+[2026-11-25 18:14:41] WROTE C:\Users\Administrator\Desktop\eac_reversal\devirt\affine_import_solver.md (total=47, arith=17, mem=4, branch=0, exit=1)
+[2026-11-25 18:14:44] DONE
